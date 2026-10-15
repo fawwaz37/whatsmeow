@@ -165,6 +165,8 @@ type SendRequestExtra struct {
 	Meta *types.MsgMetaInfo
 	// use this only if you know what you are doing
 	AdditionalNodes *[]waBinary.Node
+
+	CheckPermissions bool
 }
 
 // SendMessage sends the given message.
@@ -306,36 +308,32 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	var groupParticipants []types.JID
+	var cachedData *groupMetaCache
 	if to.Server == types.GroupServer || to.Server == types.BroadcastServer {
 		start := time.Now()
-
 		if len(req.TargetJID) > 0 {
 			groupParticipants = append(groupParticipants, req.TargetJID...)
+		} else if to.Server == types.GroupServer {
+			cachedData, err = cli.getCachedGroupData(ctx, to)
+			if err != nil {
+				err = fmt.Errorf("failed to get group members: %w", err)
+				return
+			}
+			groupParticipants = cachedData.Members
+			// TODO this is fairly hacky, is there a proper way to determine which identity the message is sent with?
+			if cachedData.AddressingMode == types.AddressingModeLID {
+				ownID = cli.getOwnLID()
+				extraParams.addressingMode = types.AddressingModeLID
+			} else if cachedData.CommunityAnnouncementGroup && req.Meta != nil {
+				ownID = cli.getOwnLID()
+				// Why is this set to PN?
+				extraParams.addressingMode = types.AddressingModePN
+			}
 		} else {
-			if to.Server == types.GroupServer {
-				var cachedData *groupMetaCache
-				cachedData, err = cli.getCachedGroupData(ctx, to)
-				if err != nil {
-					err = fmt.Errorf("failed to get group members: %w", err)
-					return
-				}
-				groupParticipants = cachedData.Members
-				// TODO this is fairly hacky, is there a proper way to determine which identity the message is sent with?
-				if cachedData.AddressingMode == types.AddressingModeLID {
-					ownID = cli.getOwnLID()
-					extraParams.addressingMode = types.AddressingModeLID
-				} else if cachedData.CommunityAnnouncementGroup && req.Meta != nil {
-					ownID = cli.getOwnLID()
-					// Why is this set to PN?
-					extraParams.addressingMode = types.AddressingModePN
-				}
-			} else {
-				// TODO use context
-				groupParticipants, err = cli.getBroadcastListParticipants(ctx, to)
-				if err != nil {
-					err = fmt.Errorf("failed to get broadcast list members: %w", err)
-					return
-				}
+			groupParticipants, err = cli.getBroadcastListParticipants(ctx, to)
+			if err != nil {
+				err = fmt.Errorf("failed to get broadcast list members: %w", err)
+				return
 			}
 		}
 		resp.DebugTimings.GetParticipants = time.Since(start)
@@ -415,6 +413,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		} else {
 			cli.Log.Debugf("Stored message secret key for outgoing message %s", req.ID)
 		}
+	}
+
+	if req.CheckPermissions && !cachedData.CanSend(ownID, message) {
+		return resp, ErrNoPermissionInGroup
 	}
 
 	respChan := cli.waitResponse(req.ID)
