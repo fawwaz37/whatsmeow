@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
@@ -31,6 +32,171 @@ const (
 	ContactQRLinkDirectPrefix       = "https://api.whatsapp.com/qr/"
 	NewsletterLinkPrefix            = "https://whatsapp.com/channel/"
 )
+
+type SpamFlow string
+
+const (
+	SpamFlowBlock                        SpamFlow = "block_dialog"
+	SpamFlowOverflowMenuBlock            SpamFlow = "overflow_menu_block"
+	SpamFlowOverflowMenuReport           SpamFlow = "overflow_menu_report"
+	SpamFlowMediaViewer                  SpamFlow = "media_viewer"
+	SpamFlowMessageMenu                  SpamFlow = "message_menu"
+	SpamFlowCommunityHome                SpamFlow = "community_home"
+	SpamFlowAccountInfoReport            SpamFlow = "account_info_report"
+	SpamFlowGroupInfoReport              SpamFlow = "group_info_report"
+	SpamFlowGroupSpamBannerReport        SpamFlow = "group_spam_banner_report"
+	SpamFlowOneToOneChatSpamBannerReport SpamFlow = "1_1_spam_banner_report"
+	SpamFlowBizSpamBannerBlock           SpamFlow = "biz_spam_banner_block"
+	SpamFlowChatListBlock                SpamFlow = "chat_list_block"
+	SpamFlowNotificationBlock            SpamFlow = "notification_block"
+	SpamFlowStatusPostReport             SpamFlow = "status_post_report"
+	SpamFlowNewsletterInfoReport         SpamFlow = "newsletter_info_report"
+)
+
+type ReportSpamOptions struct {
+	Flow        SpamFlow
+	Source      types.JID
+	Subject     string
+	IsKnownChat *bool
+}
+
+type SpamReportResult struct {
+	JID      types.JID
+	Flow     SpamFlow
+	Reported bool
+	Node     *waBinary.Node
+}
+
+type SpamReportError struct {
+	JID  types.JID
+	Flow SpamFlow
+	Code int
+	Text string
+}
+
+func (err *SpamReportError) Error() string {
+	if err == nil {
+		return "spam report rejected by server"
+	}
+	if err.Text != "" {
+		return fmt.Sprintf("spam report rejected by server (code %d, flow %s): %s", err.Code, err.Flow, err.Text)
+	}
+	if err.JID.IsEmpty() {
+		return fmt.Sprintf("spam report rejected by server for flow %s", err.Flow)
+	}
+	return fmt.Sprintf("spam report rejected by server for %s with flow %s", err.JID, err.Flow)
+}
+
+func buildSpamListNode(jid types.JID, options ReportSpamOptions) (waBinary.Node, error) {
+	if jid.IsEmpty() {
+		return waBinary.Node{}, fmt.Errorf("%q is not a jid to report", jid.String())
+	}
+	flow := options.Flow
+	if flow == "" {
+		flow = SpamFlowOverflowMenuReport
+	}
+	if flow == "" {
+		return waBinary.Node{}, errors.New("spam flow must be a non-empty string")
+	}
+	attrs := waBinary.Attrs{
+		"jid":       jid.ToNonAD(),
+		"spam_flow": string(flow),
+	}
+	if !options.Source.IsEmpty() {
+		attrs["source"] = options.Source.ToNonAD()
+	}
+	if options.Subject != "" {
+		attrs["subject"] = options.Subject
+	}
+	if options.IsKnownChat != nil {
+		attrs["is_known_chat"] = strconv.FormatBool(*options.IsKnownChat)
+	}
+	return waBinary.Node{Tag: "spam_list", Attrs: attrs}, nil
+}
+
+func makeSpamReportError(jid types.JID, flow SpamFlow, node *waBinary.Node) *SpamReportError {
+	out := &SpamReportError{JID: jid, Flow: flow}
+	if node == nil {
+		return out
+	}
+	ag := node.AttrGetter()
+	out.Code = ag.OptionalInt("code")
+	out.Text = ag.OptionalString("text")
+	return out
+}
+
+func readSpamReportResult(sent waBinary.Node, result *waBinary.Node) (*SpamReportResult, error) {
+	if result == nil {
+		return nil, errors.New("nil spam report result")
+	}
+	if errorNode, ok := result.GetOptionalChildByTag("error"); ok {
+		jid := types.JID{}
+		if val, ok := sent.Attrs["jid"]; ok {
+			switch jidVal := val.(type) {
+			case types.JID:
+				jid = jidVal
+			case string:
+				parsed, err := types.ParseJID(jidVal)
+				if err == nil {
+					jid = parsed
+				}
+			}
+		}
+		flow := SpamFlow("")
+		if val, ok := sent.Attrs["spam_flow"]; ok {
+			if flowVal, ok := val.(string); ok {
+				flow = SpamFlow(flowVal)
+			}
+		}
+		return nil, makeSpamReportError(jid, flow, &errorNode)
+	}
+	out := &SpamReportResult{Reported: true, Node: result}
+	if val, ok := sent.Attrs["jid"]; ok {
+		switch jid := val.(type) {
+		case types.JID:
+			out.JID = jid
+		case string:
+			parsed, err := types.ParseJID(jid)
+			if err == nil {
+				out.JID = parsed
+			}
+		}
+	}
+	if val, ok := sent.Attrs["spam_flow"]; ok {
+		if flow, ok := val.(string); ok {
+			out.Flow = SpamFlow(flow)
+		}
+	}
+	return out, nil
+}
+
+// ReportSpam sends a chat-level spam report similar to WhatsApp Web's report action.
+//
+// The default flow is OverflowMenuReport when no flow is provided.
+func (cli *Client) ReportSpam(ctx context.Context, jid types.JID, options ReportSpamOptions) (*SpamReportResult, error) {
+	node, err := buildSpamListNode(jid, options)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "spam",
+		Type:      iqSet,
+		To:        types.ServerJID,
+		Content:   []waBinary.Node{node},
+	})
+	if err != nil {
+		var iqErr *IQError
+		if errors.As(err, &iqErr) && iqErr.ErrorNode != nil {
+			flow := SpamFlowOverflowMenuReport
+			if options.Flow != "" {
+				flow = options.Flow
+			}
+			return nil, makeSpamReportError(jid, flow, iqErr.ErrorNode)
+		}
+		return nil, err
+	}
+	return readSpamReportResult(node, resp)
+}
 
 func stripQuery(link string) string {
 	if idx := strings.Index(link, "?"); idx > 0 {
