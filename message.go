@@ -372,7 +372,9 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		if encType == "pkmsg" || encType == "msg" {
 			decrypted, ciphertextHash, err = cli.decryptDM(ctx, &child, senderEncryptionJID, encType == "pkmsg", info.Timestamp)
 			containsDirectMsg = true
-		} else if info.IsGroup && encType == "skmsg" {
+		} else if info.IsGroup && (encType == "skmsg" || encType == "otsk") {
+			// otsk = one-time sender key (WA: status media ke grup besar). SKDM-nya ikut di pkmsg/msg
+			// stanza yang sama, yang sudah diproses lebih dulu, jadi cukup didekripsi seperti skmsg.
 			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp)
 		} else if encType == "msmsg" && info.Sender.IsBot() {
 			targetSenderJID := info.MsgMetaInfo.TargetSender
