@@ -48,10 +48,6 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 		cli.sendAck(ctx, node, NackParsingError)
 		return
 	}
-	cli.handleParsedEncryptedMessage(ctx, info, node)
-}
-
-func (cli *Client) handleParsedEncryptedMessage(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
 	if !info.SenderAlt.IsEmpty() {
 		cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
 	} else if !info.RecipientAlt.IsEmpty() {
@@ -63,6 +59,7 @@ func (cli *Client) handleParsedEncryptedMessage(ctx context.Context, info *types
 	if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
 		go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
 	}
+	info.StanzaTag = node.Tag
 	if info.Sender.Server == types.NewsletterServer {
 		var cancelled bool
 		defer cli.maybeDeferredAck(ctx, node)(&cancelled)
@@ -70,27 +67,6 @@ func (cli *Client) handleParsedEncryptedMessage(ctx context.Context, info *types
 	} else {
 		cli.decryptMessages(ctx, info, node)
 	}
-}
-
-func (cli *Client) handleUnencryptedMessage(ctx context.Context, node *waBinary.Node) {
-	info, err := cli.parseMessageInfo(node)
-	if err != nil {
-		cli.Log.Warnf("Failed to parse message: %v", err)
-		cli.sendAck(ctx, node, NackParsingError)
-		return
-	}
-	if info.Sender.Server != types.NewsletterServer {
-		if len(node.GetChildrenByTag("enc")) > 0 {
-			cli.handleParsedEncryptedMessage(ctx, info, node)
-		} else {
-			cli.sendAck(ctx, node, 0)
-		}
-		return
-	}
-	info.IsNewsletterStatus = true
-	var cancelled bool
-	defer cli.maybeDeferredAck(ctx, node)(&cancelled)
-	cancelled = cli.handlePlaintextMessage(ctx, info, node)
 }
 
 func (cli *Client) parseMessageSource(node *waBinary.Node, requireParticipant bool) (source types.MessageSource, err error) {
